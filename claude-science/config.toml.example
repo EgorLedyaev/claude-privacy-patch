@@ -1,0 +1,8 @@
+[network]
+proxy = "http://127.0.0.1:10809"
+
+[update]
+auto_update = false
+
+[conda]
+ssl_no_revoke = true
