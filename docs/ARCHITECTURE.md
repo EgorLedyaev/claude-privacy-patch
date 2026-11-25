@@ -2,48 +2,31 @@
 
 ## 1. Claude Desktop (`claude-desktop/`)
 
-### Поверхность утечек в оригинальном клиенте (Electron + MSIX)
-1. **Electron Fuses**: оригинальный `claude.exe` собран с включёнными предохранителями `EnableEmbeddedAsarIntegrityValidation` и `OnlyLoadAppFromAsar`, из-за чего любая модификация `resources\app.asar` прерывает запуск с фатальной ошибкой целостности заголовка ASAR.
-2. **Сетевые интерфейсы (`index.chunk-*.js`)**: бандл вызывает `os.networkInterfaces()`, собирая имена сетевых адаптеров (включая VPN/TUN-адаптеры), MAC-адреса и локальные IP.
-3. **Идентификаторы устройства**: в HTTP-заголовки запросов добавляется `anthropic-device-id` / `ant-did` (управляется флагом `IKt`).
-4. **WebRTC и часовой пояс**: без явных ключей Chromium STUN/TURN UDP-запросы могут обходить HTTP-прокси, а `Intl` / `navigator.language` передают системную таймзону и локаль.
-5. **Телеметрия**: Sentry (`*.sentry.io`), Datadog RUM (`/api/v2/rum`, `*.datadoghq.com`) и Statsig.
-
-### Реализованные уровни защиты
-- **Снятие Electron Fuses** (`@electron/fuses`): перевод `EnableEmbeddedAsarIntegrityValidation` и `OnlyLoadAppFromAsar` в `false` (булево значение, т.к. числовые константы в API трактуются как truthy).
-- **Патч `.vite/build/index.pre.js`**:
-  - Инжект переключателей Chromium до инициализации `app`: `--proxy-server`, `--force-webrtc-ip-handling-policy=disable_non_proxied_udp`, `--disable-webrtc-hw-decoding`, `--timezone`, `--lang`.
-  - Подключение внешнего `enhancements/loader.js`.
-- **Патч `.vite/build/index.chunk-*.js`**:
-  - Заглушка `s.networkInterfaces` → `() => ({})`.
-  - Отключение прикрепления `device-id` (`IKt=!0` → `IKt=!1`).
-- **Main-process Privacy Shield (`enhancements/loader.js`)**:
-  - `session.defaultSession.webRequest.onBeforeRequest`: блокировка доменов `sentry.io`, `datadoghq.com`, `statsig.com`, `statsigapi.net`.
-  - `session.defaultSession.webRequest.onBeforeSendHeaders`: удаление `anthropic-device-id`, `ant-did`, `x-datadog-*`, `sentry-trace`, `baggage`.
-  - Обработчики `second-instance` и `browser-window-created` для гарантированного показа и фокуса окна при повторном клике по ярлыку.
-- **Системные политики (`HKCU\SOFTWARE\Policies\Claude`)**:
-  - `disableAutoUpdates = 1`
-  - `disableEssentialTelemetry = 1`
-  - `disableNonessentialTelemetry = 1`
-  - `disableNonessentialServices = 1`
+### Векторы утечек и их закрытие
+1. **Electron Fuses**: оригинальный `claude.exe` проверяет целостность ASAR (`EnableEmbeddedAsarIntegrityValidation`). Патчер отключает `EnableEmbeddedAsarIntegrityValidation` и `OnlyLoadAppFromAsar` через `@electron/fuses`.
+2. **Сетевые интерфейсы (`os.networkInterfaces`)**: закрыто на двух уровнях — рантайм-переопределение в `loader.js` до старта бандла + версионно-независимый патч в `index.chunk-*.js`.
+3. **Идентификаторы устройства (`anthropic-device-id`, `ant-did`, `anthropic-anonymous-id`)**:
+   - Отключается флаг инициализации device-id по паттерну вокруг `"00000000-0000-0000-0000-000000000000"` в `index.chunk-*.js` (не зависит от минифицированного имени переменной);
+   - Дополнительно вырезается на сетевом уровне через `webRequest.onBeforeSendHeaders`.
+4. **Все Electron-сессии (`defaultSession` + `session.fromPartition`)**:
+   Claude Desktop создаёт изолированные сессии (например, для MCP/Cowork). `loader.js` подписывается на `app.on('session-created')` и применяет `setProxy`, блокировку телеметрии и очистку заголовков к **каждой** сессии.
+5. **Язык и таймзона**: помимо флагов `--timezone` и `--lang`, `loader.js` переопределяет `app.getPreferredSystemLanguages()`, `app.getLocale()` и `app.getSystemLocale()`, чтобы `ru-RU` не утекало из настроек Windows.
+6. **Node.js-окружение**: `loader.js` выставляет `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` для дочерних процессов (MCP-серверы, SDK).
+7. **Восстановление окна**: обработчики `second-instance` и `browser-window-created` гарантируют показ и фокус окна при клике по ярлыку.
+8. **Системные политики (`HKCU\SOFTWARE\Policies\Claude`)**: `disableAutoUpdates=1`, `disableEssentialTelemetry=1`, `disableNonessentialTelemetry=1`, `disableNonessentialServices=1`.
 
 ---
 
 ## 2. Claude Science (`claude-science/`)
 
-### Архитектура приложения
-Claude Science состоит из двух частей:
-1. **Демон Operon (`%LOCALAPPDATA%\Programs\ClaudeScience\claude-science.exe`)**: локальный сервер на `127.0.0.1:8000` (и sandbox на `8001`), управляющий моделями, Python/Conda-окружениями и 24 встроенными научными MCP-серверами.
-2. **Оболочка Electron 42.10.0 (`~/.claude-science/runtime/*/shell`)**: UI-окно поверх локального HTTP-сервера.
+### Архитектура и проверка целостности
+`claude-science.exe` (демон Operon на `127.0.0.1:8000`) хранит внутри бинарника SHA-256 хэши файлов `runtime/<version>/shell/`. Любая прямая правка `shell/main.js` или `shell/policy.js` приводит к перераспаковке оригиналов при следующем запуске.
 
-### Особенность целостности (Integrity Manifest)
-Внутрь бинарного файла `claude-science.exe` вшит полный словарь SHA-256 хэшей для директории `runtime/<version>/shell/` (включая `shell-manifest.json`, `main.js`, `policy.js`, `updater.js`). При несовпадении хэша демон автоматически перераспаковывает оригинальные файлы оболочки.
-
-### Безопасное решение без нарушения манифеста
+### Решение без нарушения манифеста
 1. **`~/.claude-science/config.toml`**:
-   - `[network] proxy = "http://127.0.0.1:10809"` — нативная директива прокси для демона.
-   - `[update] auto_update = false` — нативное отключение автообновлений (проверяется в `root-daemon-probe.js`).
-   - `[conda] ssl_no_revoke = true` — корректная проверка TLS через прокси для `micromamba`.
-2. **Изолированный лаунчер (`run-claude-science.vbs`)**:
-   Выставляет `HTTP_PROXY`, `HTTPS_PROXY` и `NO_PROXY` исключительно в блоке окружения процесса (`WshShell.Environment("PROCESS")`) перед запуском `claude-science.exe`, не загрязняя глобальные переменные пользователя.
+   - `[network] proxy = "http://127.0.0.1:10809"` — нативная директива прокси для демона;
+   - `[update] auto_update = false` — нативное отключение автообновлений;
+   - `[conda] ssl_no_revoke = true` — корректная работа TLS для `micromamba` через прокси.
+2. **Процессный лаунчер (`run-claude-science.vbs`)**:
+   Задаёт `HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` только в окружении процесса перед запуском `claude-science.exe`.
 3. **Реестровые политики (`HKCU\SOFTWARE\Policies\Claude`)**: разделяются с Claude Desktop.

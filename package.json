@@ -1,12 +1,16 @@
 {
   "name": "claude-privacy-patch",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Privacy, anti-detect, and update-resistant hardening suite for Claude Desktop & Claude Science on Windows",
+  "bin": {
+    "claude-privacy-patch": "./cli.js"
+  },
   "private": true,
   "scripts": {
-    "patch:desktop": "node claude-desktop/patch-desktop.js",
-    "patch:science": "node claude-science/patch-science.js",
-    "patch:all": "node claude-desktop/patch-desktop.js && node claude-science/patch-science.js"
+    "patch:desktop": "node cli.js patch desktop",
+    "patch:science": "node cli.js patch science",
+    "patch:all": "node cli.js patch all",
+    "status": "node cli.js status"
   },
   "dependencies": {
     "@electron/asar": "^3.2.18",
