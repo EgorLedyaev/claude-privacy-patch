@@ -1,4 +1,4 @@
 @echo off
 cd /d "%~dp0"
-node cli.js status
+node cli.js doctor
 pause

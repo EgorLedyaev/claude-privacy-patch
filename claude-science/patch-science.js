@@ -55,20 +55,18 @@ ssl_no_revoke = true
     execSync(`reg add HKCU\\SOFTWARE\\Policies\\Claude /v ${key} /t REG_DWORD /d 1 /f`, { stdio: 'ignore' });
   }
 
-  // 4. Install process-scoped proxy launcher & update Desktop shortcut
-  console.log('[4/4] Installing protected launcher & updating Desktop shortcut...');
+  // 4. Install Geo-Guarded process-scoped proxy launcher & update Desktop shortcut
+  console.log('[4/4] Installing Geo-Guarded launcher & updating Desktop shortcut...');
   if (!fs.existsSync(progDir)) {
     console.warn(`      WARNING: ${progDir} not found. Install Claude Science first, then re-run this script.`);
   } else {
+    fs.copyFileSync(path.join(__dirname, '..', 'shared', 'geo-guard.js'), path.join(progDir, 'geo-guard.js'));
+    fs.copyFileSync(path.join(__dirname, '..', 'shared', 'launch-guarded.js'), path.join(progDir, 'launch-guarded.js'));
+    const launchJs = path.join(progDir, 'launch-guarded.js');
+
     const vbsLauncher = `Set oShell = CreateObject("WScript.Shell")
-Set oEnv = oShell.Environment("PROCESS")
-
-oEnv("HTTP_PROXY") = "${proxyUrl}"
-oEnv("HTTPS_PROXY") = "${proxyUrl}"
-oEnv("NO_PROXY") = "localhost,127.0.0.1"
-
 oShell.CurrentDirectory = "${progDir}"
-oShell.Run """${exePath}""", 1, False
+oShell.Run "node ""${launchJs}"" --target ""${exePath}"" --cwd ""${progDir}"" --proxy ""${proxyUrl}"" --title ""Claude Science"" --env ""HTTP_PROXY=${proxyUrl}"" --env ""HTTPS_PROXY=${proxyUrl}"" --env ""NO_PROXY=localhost,127.0.0.1"" --env ""TZ=Europe/Berlin""", 0, False
 `;
     fs.writeFileSync(launcherVbs, vbsLauncher, 'utf8');
 

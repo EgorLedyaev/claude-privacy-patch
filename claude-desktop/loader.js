@@ -3,9 +3,10 @@
  * Runs before app initialization via index.pre.js hook.
  * - Reads runtime config from enhancements/config.json
  * - Stubs os.networkInterfaces() and locale getters
- * - Enforces proxy on Chromium command line, Node env, and all Electron sessions
- * - Blocks telemetry domains (Sentry, Datadog, Statsig, GrowthBook)
- * - Strips device-id and tracing headers on all sessions
+ * - Enforces proxy on Chromium CLI, Node env (incl. Claude Code), and all Electron sessions
+ * - Prevents Chromium local DNS leaks via host-resolver-rules
+ * - Spoofs Intl.DateTimeFormat, getTimezoneOffset, and navigator.languages in renderer
+ * - Blocks telemetry domains & strips tracking headers on all sessions
  * - Ensures window visibility and second-instance focus
  */
 const fs = require('fs');
@@ -83,10 +84,51 @@ function hardenSession(sess, proxyUrl) {
   });
 }
 
+function buildRendererSpoofScript(tz, lang) {
+  const shortLang = lang.split('-')[0];
+  return `(() => {
+    if (window.__claudePrivacySpoofed) return;
+    window.__claudePrivacySpoofed = true;
+    const TARGET_TZ = ${JSON.stringify(tz)};
+    const TARGET_LANG = ${JSON.stringify(lang)};
+    const TARGET_LANGS = Object.freeze([TARGET_LANG, ${JSON.stringify(shortLang)}]);
+
+    try {
+      Object.defineProperty(navigator, 'language', { get: () => TARGET_LANG, configurable: true });
+      Object.defineProperty(navigator, 'languages', { get: () => TARGET_LANGS, configurable: true });
+    } catch {}
+
+    try {
+      const OrigDTF = Intl.DateTimeFormat;
+      const PatchedDTF = function(locales, options) {
+        const opts = options ? { ...options } : {};
+        if (!opts.timeZone) opts.timeZone = TARGET_TZ;
+        return new OrigDTF(locales || TARGET_LANG, opts);
+      };
+      PatchedDTF.prototype = OrigDTF.prototype;
+      PatchedDTF.supportedLocalesOf = OrigDTF.supportedLocalesOf.bind(OrigDTF);
+      Intl.DateTimeFormat = PatchedDTF;
+
+      Date.prototype.getTimezoneOffset = function() {
+        try {
+          const parts = new OrigDTF('en-US', { timeZone: TARGET_TZ, timeZoneName: 'shortOffset' }).formatToParts(this);
+          const tzPart = parts.find(p => p.type === 'timeZoneName')?.value || '';
+          const m = /GMT([+-])(\\d{1,2})(?::(\\d{2}))?/.exec(tzPart);
+          if (m) {
+            const sign = m[1] === '+' ? -1 : 1;
+            return sign * (parseInt(m[2], 10) * 60 + parseInt(m[3] || '0', 10));
+          }
+        } catch {}
+        return -60;
+      };
+    } catch {}
+  })();`;
+}
+
 function initPrivacyShield() {
   const cfg = loadConfig();
 
-  // 1. Runtime OS & Locale spoofing (version-independent)
+  // 1. Runtime OS, Timezone & Child-Process Env Hardening
   try {
     os.networkInterfaces = () => ({});
   } catch {}
@@ -96,12 +138,25 @@ function initPrivacyShield() {
     process.env.HTTPS_PROXY = cfg.proxy;
     process.env.NO_PROXY = 'localhost,127.0.0.1,::1';
   }
+  if (cfg.timezone) {
+    process.env.TZ = cfg.timezone;
+  }
+
+  // Harden built-in Claude Code & MCP child processes
+  process.env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC = '1';
+  process.env.DISABLE_TELEMETRY = '1';
+  process.env.DISABLE_ERROR_REPORTING = '1';
+  process.env.DISABLE_AUTOUPDATER = '1';
+  process.env.DISABLE_BUG_COMMAND = '1';
 
   if (app && app.commandLine) {
-    if (cfg.proxy) app.commandLine.appendSwitch('proxy-server', cfg.proxy);
+    if (cfg.proxy) {
+      app.commandLine.appendSwitch('proxy-server', cfg.proxy);
+      // Force all external DNS resolution through the proxy (prevents local DNS leaks)
+      app.commandLine.appendSwitch('host-resolver-rules', 'MAP * ~NOTFOUND , EXCLUDE 127.0.0.1');
+    }
     app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'disable_non_proxied_udp');
     app.commandLine.appendSwitch('disable-webrtc-hw-decoding');
-    if (cfg.timezone) app.commandLine.appendSwitch('timezone', cfg.timezone);
     if (cfg.lang) app.commandLine.appendSwitch('lang', cfg.lang);
   }
 
@@ -148,6 +203,19 @@ function initPrivacyShield() {
   // 4. Harden defaultSession AND every custom/partitioned session
   app.on('session-created', (sess) => {
     hardenSession(sess, cfg.proxy);
+  });
+
+  // 5. Inject renderer TZ & language spoof into web pages
+  const spoofScript = buildRendererSpoofScript(cfg.timezone, cfg.lang);
+  app.on('web-contents-created', (_evt, wc) => {
+    wc.on('dom-ready', () => {
+      try {
+        const url = wc.getURL() || '';
+        if (url.startsWith('http://') || url.startsWith('https://')) {
+          wc.executeJavaScript(spoofScript).catch(() => {});
+        }
+      } catch {}
+    });
   });
 
   app.on('ready', () => {

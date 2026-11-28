@@ -89,10 +89,12 @@ async function patchDesktop(opts = {}) {
     console.log('      Fuses already disabled (skipping binary write).');
   }
 
-  // 6. Install loader.js + config.json & patch app.asar if needed
+  // 6. Install loader.js + config.json + Geo-Guard launcher & patch app.asar if needed
   console.log('[6/7] Installing Privacy Shield & checking app.asar...');
   fs.mkdirSync(enhancementsDir, { recursive: true });
   fs.copyFileSync(loaderSrc, loaderDst);
+  fs.copyFileSync(path.join(__dirname, '..', 'shared', 'geo-guard.js'), path.join(enhancementsDir, 'geo-guard.js'));
+  fs.copyFileSync(path.join(__dirname, '..', 'shared', 'launch-guarded.js'), path.join(enhancementsDir, 'launch-guarded.js'));
   fs.writeFileSync(configDst, JSON.stringify({ proxy: proxyUrl, timezone, lang: locale }, null, 2), 'utf8');
 
   const asar = require('@electron/asar');
@@ -162,8 +164,16 @@ try {
   }
   fs.rmSync(tmpExtract, { recursive: true, force: true });
 
-  // 7. Create/Update single clean Desktop shortcut & remove legacy duplicate
-  console.log('[7/7] Updating Desktop shortcut (Claude.lnk)...');
+  // 7. Create Geo-Guarded VBS launcher & update Desktop shortcut (Claude.lnk)
+  console.log('[7/7] Updating Geo-Guarded Desktop shortcut (Claude.lnk)...');
+  const launcherVbs = path.join(enhancementsDir, 'run-claude-desktop.vbs');
+  const launchJs = path.join(enhancementsDir, 'launch-guarded.js');
+  const vbsLauncher = `Set oShell = CreateObject("WScript.Shell")
+oShell.CurrentDirectory = "${targetDir}"
+oShell.Run "node ""${launchJs}"" --target ""${exePath}"" --cwd ""${targetDir}"" --proxy ""${proxyUrl}"" --title ""Claude Desktop""", 0, False
+`;
+  fs.writeFileSync(launcherVbs, vbsLauncher, 'utf8');
+
   const desktopDir = path.join(process.env.USERPROFILE, 'Desktop');
   const desktopLnk = path.join(desktopDir, 'Claude.lnk');
   const oldLnk = path.join(desktopDir, 'Claude (Patched).lnk');
@@ -174,9 +184,11 @@ try {
   const vbs = `
 Set sh = CreateObject("WScript.Shell")
 Set lnk = sh.CreateShortcut("${desktopLnk.replace(/\\/g, '\\\\')}")
-lnk.TargetPath = "${exePath.replace(/\\/g, '\\\\')}"
+lnk.TargetPath = "wscript.exe"
+lnk.Arguments = """${launcherVbs.replace(/\\/g, '\\\\')}"""
 lnk.WorkingDirectory = "${targetDir.replace(/\\/g, '\\\\')}"
-lnk.Description = "Claude Desktop (Privacy Hardened)"
+lnk.IconLocation = "${exePath.replace(/\\/g, '\\\\')},0"
+lnk.Description = "Claude Desktop (Geo-Guarded & Privacy Hardened)"
 lnk.Save
 `;
   const vbsPath = path.join(process.env.TEMP, 'update_claude_lnk.vbs');

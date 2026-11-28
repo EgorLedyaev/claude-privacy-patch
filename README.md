@@ -1,57 +1,30 @@
 # Claude Privacy & Anti-Detect Patch (Windows)
 
-Полноценная CLI-утилита и набор идемпотентных патчей для **Claude Desktop** и **Claude Science** на Windows:
-- **Принудительный прокси** (`--proxy`, по умолчанию `http://127.0.0.1:10809`) для Chromium, **всех** Electron-сессий (`defaultSession` + `session-created` / `fromPartition`), Node.js-окружения (`HTTP_PROXY`/`HTTPS_PROXY`) и демона Claude Science;
-- **Защита от сетевых и аппаратных утечек**: заглушка `os.networkInterfaces()` в рантайме и бандле, удаление `anthropic-device-id`, `ant-did`, `anthropic-anonymous-id`;
-- **Защита от WebRTC-утечек**: `disable_non_proxied_udp` и `disable-webrtc-hw-decoding`;
-- **Спуфинг таймзоны и локали**: `timezone` + `lang` + переопределение `app.getPreferredSystemLanguages()`, `app.getLocale()`, `app.getSystemLocale()`;
-- **Блокировка телеметрии**: Sentry, Datadog RUM, Statsig, GrowthBook + удаление трассировочных заголовков (`x-datadog-*`, `sentry-trace`, `baggage`);
-- **Устойчивость к обновлениям**: Group Policy в `HKCU\SOFTWARE\Policies\Claude`, изолированная папка `Claude-Patched`, нативный `config.toml`, динамический `enhancements/config.json` и встроенный аудит `status`.
+Полноценная CLI-утилита и набор идемпотентных патчей для **Claude Desktop**, **Claude Science** и **Claude Code CLI** на Windows (под сплит-роутинг вроде `v2raytun` без системного VPN):
 
----
-
-## Структура репозитория
-
-```text
-claude-privacy-patch/
-├── cli.js                                # Единый CLI (patch desktop/science/all, status)
-├── package.json                          # Зависимости (@electron/asar, @electron/fuses)
-├── Patch-All.bat                         # 1-Click патч для Desktop + Science
-├── Verify-Status.bat                     # 1-Click аудит всех защит и прокси
-├── README.md                             # Документация
-├── docs/
-│   └── ARCHITECTURE.md                   # Технический разбор векторов и защиты
-├── claude-desktop/
-│   ├── patch-desktop.js                  # Патчер Claude Desktop (--sync, Fuses, ASAR, реестр)
-│   ├── loader.js                         # Main-process Privacy Shield (все сессии + окна)
-│   └── Patch-Claude-Desktop.bat          # 1-Click патч только для Claude Desktop
-└── claude-science/
-    ├── patch-science.js                  # Конфигуратор Claude Science
-    ├── config.toml.example               # Шаблон ~/.claude-science/config.toml
-    ├── run-claude-science.vbs            # Лаунчер с изоляцией HTTP_PROXY / HTTPS_PROXY
-    └── Patch-Claude-Science.bat          # 1-Click настройка только для Claude Science
-```
+- **Pre-Flight Geo-Guard**: перед запуском любого из трёх клиентов проверяет локальный прокси и внешний IP/страну. Если прокси отключён или egress-страна `RU` / `BY` — запуск блокируется с уведомлением;
+- **Chromium DNS-Lock & WebRTC Shield**: `--host-resolver-rules="MAP * ~NOTFOUND , EXCLUDE 127.0.0.1"`, `disable_non_proxied_udp`, `disable-webrtc-hw-decoding`;
+- **Полная изоляция Electron-сессий**: `setProxy`, блокировка телеметрии (Sentry, Datadog RUM, Statsig, GrowthBook) и удаление `anthropic-device-id`, `ant-did`, `anthropic-anonymous-id`, `x-datadog-*`, `sentry-trace`, `baggage` для `defaultSession` и всех `session-created` / `fromPartition`;
+- **Реальный спуфинг таймзоны и локали в JS**: `process.env.TZ`, `app.getPreferredSystemLanguages()`, `app.getLocale()`, а также переопределение `Intl.DateTimeFormat`, `Date.prototype.getTimezoneOffset`, `navigator.language(s)` в рендерере;
+- **Защита Claude Code CLI**: настройка `~/.claude/settings.json` (`HTTP_PROXY`, `HTTPS_PROXY`, `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1`, `DISABLE_TELEMETRY=1`, `DISABLE_ERROR_REPORTING=1`, `DISABLE_AUTOUPDATER=1`), политики `HKCU\SOFTWARE\Policies\ClaudeCode` и Geo-Guarded обёртка `claude-safe.cmd`;
+- **Windows Firewall UDP Kill-Switch** (`cli.js firewall enable --elevate`): блокировка исходящего UDP на уровне ядра ОС для всех бинарников Claude;
+- **Устойчивость к обновлениям** и глубокая диагностика `cli.js doctor`.
 
 ---
 
 ## Быстрый старт
 
-1. Установите зависимости:
-   ```cmd
-   npm install
-   ```
+```cmd
+npm install
+node cli.js patch all
+node cli.js doctor
+```
+Или используйте батники в корне: **`Patch-All.bat`** и **`Verify-Status.bat`**.
 
-2. Запустите общий патч (или отдельные батники):
-   ```cmd
-   node cli.js patch all
-   ```
-   Или кликните **`Patch-All.bat`**.
-
-3. Проверьте статус всех защит и доступность прокси:
-   ```cmd
-   node cli.js status
-   ```
-   Или кликните **`Verify-Status.bat`**.
+### Опциональный Firewall Kill-Switch (требует UAC)
+```cmd
+node cli.js firewall enable --elevate
+```
 
 ---
 
@@ -60,18 +33,14 @@ claude-privacy-patch/
 ```text
 node cli.js patch desktop [--sync] [--proxy URL] [--tz TZ] [--lang LANG]
 node cli.js patch science [--proxy URL]
+node cli.js patch code    [--proxy URL] [--tz TZ]
 node cli.js patch all     [--sync] [--proxy URL] [--tz TZ] [--lang LANG]
-node cli.js status
+node cli.js doctor        Полный аудит (Fuses, ASAR, реестр, CLI, Firewall, реальный Egress IP)
+node cli.js firewall enable|disable|status [--elevate]
 ```
 
-- `--sync` — подтянуть свежие файлы Claude Desktop из установленного пакета `C:\Program Files\WindowsApps\Claude_*` в `%LOCALAPPDATA%\Programs\Claude-Patched` и заново пропатчить.
-- `--proxy` — адрес локального HTTP-прокси (по умолчанию `http://127.0.0.1:10809`). Для Claude Desktop параметры сохраняются в `enhancements/config.json`, поэтому сменить прокси можно без перепаковки `app.asar`.
-- `--tz` / `--lang` — таймзона и язык Chromium/Electron (по умолчанию `Europe/Berlin` и `en-US`).
-
----
-
-## Проверка работы
-
-- Запускайте приложения через обновлённые ярлыки **`Claude`** и **`Claude Science`** на Рабочем столе (при включённом `v2raytun`).
-- Для проверки Claude Science убедитесь, что в логах (`claude-science.com logs`) присутствует строка:
-  `[proxy] proxy from environment — ... https via http://127.0.0.1:10809 (HTTPS_PROXY), http via http://127.0.0.1:10809 (HTTP_PROXY)`.
+Для запуска **Claude Code CLI** с проверкой прокси и страны используйте:
+```cmd
+%USERPROFILE%\.local\bin\claude-safe.cmd
+```
+(Добавьте `%USERPROFILE%\.local\bin` в `PATH`, чтобы вызывать `claude-safe` из любой папки.)
