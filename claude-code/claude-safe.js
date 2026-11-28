@@ -1,53 +1,32 @@
 #!/usr/bin/env node
 /**
- * Geo-Guarded Claude Code CLI Wrapper (claude-safe)
- * Verifies proxy + non-RU/BY egress IP before spawning claude.exe.
+ * Cross-Platform Geo-Guarded Claude Code CLI Wrapper (claude-safe)
+ * Verifies proxy + non-RU/BY egress IP and resolves the latest claude binary
+ * across Windows, macOS, and Linux before launching.
  */
 const fs = require('fs');
 const path = require('path');
-const { spawnSync, execFileSync } = require('child_process');
+const os = require('os');
+const { spawnSync } = require('child_process');
 const { verifyEgress } = require('./geo-guard');
+const { findClaudeCodeExe } = require('./platform');
 
-function findClaudeCodeExe() {
-  const localBin = path.join(process.env.USERPROFILE, '.local', 'bin', 'claude.exe');
-  if (fs.existsSync(localBin)) return localBin;
-
-  const appDataBase = path.join(process.env.APPDATA, 'Claude', 'claude-code');
-  if (fs.existsSync(appDataBase)) {
-    const versions = fs.readdirSync(appDataBase).sort().reverse();
-    for (const v of versions) {
-      const vDir = path.join(appDataBase, v);
-      if (!fs.statSync(vDir).isDirectory()) continue;
-      for (const sub of fs.readdirSync(vDir)) {
-        const candidate = path.join(vDir, sub, 'claude.exe');
-        if (fs.existsSync(candidate)) return candidate;
-      }
-    }
-  }
-
+function getConfiguredSettings() {
   try {
-    const out = execFileSync('where.exe', ['claude.exe'], { stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim();
-    if (out) return out.split(/\r?\n/)[0].trim();
-  } catch {}
-
-  return null;
-}
-
-function getConfiguredProxy() {
-  try {
-    const settingsPath = path.join(process.env.USERPROFILE, '.claude', 'settings.json');
+    const settingsPath = path.join(os.homedir(), '.claude', 'settings.json');
     if (fs.existsSync(settingsPath)) {
       const s = JSON.parse(fs.readFileSync(settingsPath, 'utf8'));
-      if (s.env && (s.env.HTTPS_PROXY || s.env.HTTP_PROXY)) {
-        return s.env.HTTPS_PROXY || s.env.HTTP_PROXY;
-      }
+      return s.env || {};
     }
   } catch {}
-  return process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:10809';
+  return {};
 }
 
 async function main() {
-  const proxy = getConfiguredProxy();
+  const cfgEnv = getConfiguredSettings();
+  const proxy = cfgEnv.HTTPS_PROXY || cfgEnv.HTTP_PROXY || process.env.HTTPS_PROXY || process.env.HTTP_PROXY || 'http://127.0.0.1:10809';
+  const tz = cfgEnv.TZ || 'Europe/Berlin';
+
   const check = await verifyEgress(proxy);
   if (!check.ok) {
     console.error(`\x1b[31m[claude-safe] BLOCKED:\x1b[0m ${check.message}`);
@@ -56,7 +35,7 @@ async function main() {
 
   const exe = findClaudeCodeExe();
   if (!exe) {
-    console.error('[claude-safe] claude.exe not found.');
+    console.error('[claude-safe] Claude Code binary not found.');
     process.exit(1);
   }
 
@@ -74,7 +53,7 @@ async function main() {
       DISABLE_ERROR_REPORTING: '1',
       DISABLE_AUTOUPDATER: '1',
       DISABLE_BUG_COMMAND: '1',
-      TZ: 'Europe/Berlin'
+      TZ: tz
     }
   });
   process.exit(res.status ?? 0);

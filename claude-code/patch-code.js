@@ -1,23 +1,25 @@
 /**
- * Claude Code CLI Privacy, Proxy & Anti-Telemetry Hardener
- * - Merges hardened env vars into ~/.claude/settings.json
- * - Sets HKCU\SOFTWARE\Policies\ClaudeCode flags
- * - Installs geo-guarded `claude-safe.cmd` into ~/.local/bin/
+ * Cross-Platform Claude Code CLI Privacy, Proxy & Anti-Telemetry Hardener
+ * Works on Windows, macOS, and Linux.
+ * - Merges hardened env vars into ~/.claude/settings.json (update-proof)
+ * - Applies OS Enterprise Policies (Windows HKCU / macOS defaults)
+ * - Installs geo-guarded `claude-safe` wrapper into ~/.local/bin/
  */
 const fs = require('fs');
 const path = require('path');
-const { execSync } = require('child_process');
+const { PLATFORM, HOME, applyEnterprisePolicies } = require('../shared/platform');
+
+const REPO_ROOT = path.resolve(__dirname, '..');
 
 async function patchCode(opts = {}) {
   const proxyUrl = opts.proxy || process.env.CLAUDE_PROXY || 'http://127.0.0.1:10809';
   const timezone = opts.tz || 'Europe/Berlin';
 
-  const home = process.env.USERPROFILE;
-  const claudeDir = path.join(home, '.claude');
+  const claudeDir = path.join(HOME, '.claude');
   const settingsPath = path.join(claudeDir, 'settings.json');
-  const binDir = path.join(home, '.local', 'bin');
+  const binDir = path.join(HOME, '.local', 'bin');
 
-  console.log('=== CLAUDE CODE CLI PRIVACY & TELEMETRY HARDENER ===');
+  console.log(`=== CLAUDE CODE CLI PRIVACY & TELEMETRY HARDENER (${PLATFORM}) ===`);
   console.log(`Proxy: ${proxyUrl} | Timezone: ${timezone}`);
 
   // 1. Merge hardened env into ~/.claude/settings.json
@@ -48,20 +50,26 @@ async function patchCode(opts = {}) {
   fs.writeFileSync(settingsPath, JSON.stringify(settings, null, 2), 'utf8');
   console.log(`      Updated ${settingsPath}`);
 
-  // 2. Apply Group Policy flags under HKCU\SOFTWARE\Policies\ClaudeCode
-  console.log('[2/3] Applying Group Policy flags (HKCU\\SOFTWARE\\Policies\\ClaudeCode)...');
-  for (const key of ['disableAutoUpdates', 'disableEssentialTelemetry', 'disableNonessentialTelemetry', 'disableNonessentialServices']) {
-    execSync(`reg add HKCU\\SOFTWARE\\Policies\\ClaudeCode /v ${key} /t REG_DWORD /d 1 /f`, { stdio: 'ignore' });
-  }
+  // 2. Apply OS Enterprise Policies
+  console.log('[2/3] Applying OS Enterprise Policies...');
+  applyEnterprisePolicies('code');
 
-  // 3. Install claude-safe wrapper into ~/.local/bin
+  // 3. Install cross-platform claude-safe wrapper into ~/.local/bin
   console.log('[3/3] Installing claude-safe geo-guarded wrapper...');
   fs.mkdirSync(binDir, { recursive: true });
-  fs.copyFileSync(path.join(__dirname, '..', 'shared', 'geo-guard.js'), path.join(binDir, 'geo-guard.js'));
+  fs.copyFileSync(path.join(REPO_ROOT, 'shared', 'geo-guard.js'), path.join(binDir, 'geo-guard.js'));
+  fs.copyFileSync(path.join(REPO_ROOT, 'shared', 'platform.js'), path.join(binDir, 'platform.js'));
   fs.copyFileSync(path.join(__dirname, 'claude-safe.js'), path.join(binDir, 'claude-safe.js'));
-  const cmdContent = `@echo off\r\nnode "%~dp0claude-safe.js" %*\r\n`;
-  fs.writeFileSync(path.join(binDir, 'claude-safe.cmd'), cmdContent, 'utf8');
-  console.log(`      Installed ${path.join(binDir, 'claude-safe.cmd')}`);
+
+  if (PLATFORM === 'win32') {
+    fs.writeFileSync(path.join(binDir, 'claude-safe.cmd'), '@echo off\r\nnode "%~dp0claude-safe.js" %*\r\n', 'utf8');
+    console.log(`      Installed ${path.join(binDir, 'claude-safe.cmd')}`);
+  } else {
+    const shWrapper = path.join(binDir, 'claude-safe');
+    fs.writeFileSync(shWrapper, '#!/usr/bin/env bash\nexec node "$(dirname "$0")/claude-safe.js" "$@"\n', { mode: 0o755 });
+    console.log(`      Installed ${shWrapper} (ensure ~/.local/bin is in PATH)`);
+  }
+
   console.log('=== CLAUDE CODE CLI HARDENING COMPLETE ===\n');
 }
 

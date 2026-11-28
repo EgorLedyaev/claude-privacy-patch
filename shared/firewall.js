@@ -1,80 +1,68 @@
 /**
- * Windows Defender Firewall Kill-Switch for Claude Apps
- * Blocks all direct outbound UDP traffic (eliminating WebRTC/STUN/QUIC leaks)
- * for Claude Desktop, Claude Science, and Claude Code CLI binaries.
+ * Firewall UDP Kill-Switch for Claude Apps
+ * - Windows: manages netsh advfirewall outbound UDP block rules per binary
+ * - macOS / Linux: reports status and provides safe PF / nftables hints
  */
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+const { PLATFORM, getDesktopTarget, getSciencePaths, findClaudeCodeExe } = require('./platform');
 
 const RULE_PREFIX = 'ClaudePrivacyPatch_BlockUDP_';
 
 function isAdmin() {
-  try {
-    execSync('net session', { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
+  if (PLATFORM === 'win32') {
+    try { execSync('net session', { stdio: 'ignore' }); return true; } catch { return false; }
   }
+  return typeof process.getuid === 'function' && process.getuid() === 0;
 }
 
 function getTargetBinaries() {
   const bins = [];
-  const localAppData = process.env.LOCALAPPDATA;
-  const home = process.env.USERPROFILE;
-  const appData = process.env.APPDATA;
+  const dt = getDesktopTarget();
+  if (fs.existsSync(dt.exePath)) bins.push({ name: 'Desktop', exe: dt.exePath });
 
-  const candidates = [
-    { name: 'Desktop', exe: path.join(localAppData, 'Programs', 'Claude-Patched', 'claude.exe') },
-    { name: 'ScienceDaemon', exe: path.join(localAppData, 'Programs', 'ClaudeScience', 'claude-science.exe') }
-  ];
+  const sp = getSciencePaths();
+  if (fs.existsSync(sp.exePath)) bins.push({ name: 'Science', exe: sp.exePath });
 
-  // Electron runtime for Claude Science
-  const electronBase = path.join(home, '.claude-science', 'electron');
-  if (fs.existsSync(electronBase)) {
-    for (const v of fs.readdirSync(electronBase)) {
-      const exe = path.join(electronBase, v, 'claude-science.exe');
-      if (fs.existsSync(exe)) {
-        candidates.push({ name: `ScienceElectron_${v}`, exe });
+  if (PLATFORM === 'win32') {
+    const electronBase = path.join(sp.scienceDir, 'electron');
+    if (fs.existsSync(electronBase)) {
+      for (const v of fs.readdirSync(electronBase)) {
+        const exe = path.join(electronBase, v, 'claude-science.exe');
+        if (fs.existsSync(exe)) bins.push({ name: `ScienceElectron_${v}`, exe });
       }
     }
   }
 
-  // Claude Code CLI binaries
-  const codeBase = path.join(appData, 'Claude', 'claude-code');
-  if (fs.existsSync(codeBase)) {
-    const findExe = (dir) => {
-      for (const ent of fs.readdirSync(dir, { withFileTypes: true })) {
-        const full = path.join(dir, ent.name);
-        if (ent.isDirectory()) findExe(full);
-        else if (ent.name === 'claude.exe') {
-          candidates.push({ name: `ClaudeCode_${path.basename(path.dirname(path.dirname(full)))}`, exe: full });
-        }
-      }
-    };
-    findExe(codeBase);
-  }
-
-  for (const c of candidates) {
-    if (fs.existsSync(c.exe)) bins.push(c);
-  }
+  const codeExe = findClaudeCodeExe();
+  if (codeExe && fs.existsSync(codeExe)) bins.push({ name: 'ClaudeCode', exe: codeExe });
   return bins;
 }
 
 function getFirewallStatus() {
+  if (PLATFORM !== 'win32') {
+    return { supported: false, installed: false, rules: [] };
+  }
   try {
-    const out = execSync(`netsh advfirewall firewall show rule name=all`, { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
+    const out = execSync('netsh advfirewall firewall show rule name=all', { stdio: ['ignore', 'pipe', 'ignore'] }).toString('utf8');
     const lines = out.split(/\r?\n/).filter(l => l.includes(RULE_PREFIX));
     return {
+      supported: true,
       installed: lines.length > 0,
       rules: lines.map(l => l.replace(/^Rule Name:\s*/i, '').trim())
     };
   } catch {
-    return { installed: false, rules: [] };
+    return { supported: true, installed: false, rules: [] };
   }
 }
 
 function enableFirewall(elevateIfNeeded = false) {
+  if (PLATFORM !== 'win32') {
+    console.log(`[Firewall] Per-binary UDP rules via netsh are Windows-only. On ${PLATFORM}, enforce WebRTC UDP blocking via Chromium flags (already active) or PF/nftables.`);
+    return false;
+  }
+
   if (!isAdmin()) {
     if (elevateIfNeeded) {
       const cliPath = path.resolve(__dirname, '..', 'cli.js');
@@ -103,6 +91,11 @@ function enableFirewall(elevateIfNeeded = false) {
 }
 
 function disableFirewall(elevateIfNeeded = false) {
+  if (PLATFORM !== 'win32') {
+    console.log(`[Firewall] No Windows rules on ${PLATFORM}.`);
+    return false;
+  }
+
   if (!isAdmin()) {
     if (elevateIfNeeded) {
       const cliPath = path.resolve(__dirname, '..', 'cli.js');
@@ -119,9 +112,7 @@ function disableFirewall(elevateIfNeeded = false) {
       console.log(`[OK] Removed firewall rule: ${ruleName}`);
     } catch {}
   }
-  if (status.rules.length === 0) {
-    console.log('No ClaudePrivacyPatch firewall rules found.');
-  }
+  if (status.rules.length === 0) console.log('No ClaudePrivacyPatch firewall rules found.');
   return true;
 }
 
